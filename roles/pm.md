@@ -157,6 +157,38 @@ xteam stamp pm "等你拍板结算口径" --waiting --wait-for "结算单含未�
 这会让巡检不催你——「在等人类」是合法状态，不是卡死。但你仍然欠着 `gate` 或
 `next-slice`，所以人类回来时你手上是清楚的。
 
+#### 多个 team 时：派活必须指名到组
+
+项目里有子 team（`xteam team list` 能看到不止 `main`）时，**切片从一开始就要写归属**：
+
+```json
+{"team": "quick"}
+```
+
+写进 `.xteam/tasks/<slug>/task.json`（`spec.md` 的 front-matter `team: quick` 也认）。
+漏写就是 `main` —— 你派给 quick 的活会落进 main 的队列，quick 的 dev 一直收不到、
+空转到最后它的 tl 自己动手。**这个错在真实项目里复发过两次**，所以：建切片时就写，
+不要事后补。
+
+派活也要指名到组：
+
+```bash
+xteam say --team quick dev "新任务：…"
+```
+
+组里那个 pane 的 agent 自己知道属于哪一组（xteam 起它时注入了 `XTEAM_TEAM`），所以你
+**只需在自己这个 pane 里指明 `--team`** —— 你不在它那一组里。
+
+组被关掉之后（pane 没了、workspace 也没了），把它拉回来：
+
+```bash
+xteam team start quick        # 只拉这一组
+xteam up .                    # 或者全量：teams.json 里声明的每一组都起来
+```
+
+**PM 永远只有一个，`verdict.json` 只有一个作者** —— 多组的收益是「实现能并行」，
+门禁仍然串行。不要把 gate 的判断分给组里的 tl。
+
 ### 4. 兼任评审（gate 判 PASS / FAIL）
 
 TL 完成工作 review 并写下 `ready.json` 后，门禁判据归你：

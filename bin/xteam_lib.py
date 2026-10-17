@@ -1787,15 +1787,22 @@ class Herdr:
             args += ["--env", f"{key}={value}"]
         return self._run(*args)
 
-    def split_pane(self, pane_id: str, direction: str = "right") -> str:
+    def split_pane(self, pane_id: str, direction: str = "right",
+                   env: dict[str, str] | None = None) -> str:
         """把一个 pane 拆成两半，返回**新** pane 的 id。
 
         herdr 的用法：`pane split --pane <ID> --direction right|down`，
         返回体把新 pane 嵌在 `result.pane` 里。**不传 --pane 只传方向是聚焦邻居**，
         完全是另一件事（v0.2.26 刚在这里栽过）。
+
+        env 必须在新 pane 上再传一次：`tab create --env` 只作用于 tab 的**第一个**
+        pane，拆出来的 pane 拿不到（实测：tab 级 TABONLY=1 在分割 pane 里不存在）。
+        少了这一步，一个组的 dev 会继承不到本该属于它的身份变量。
         """
-        res = self._run("pane", "split", "--pane", pane_id,
-                        "--direction", direction)
+        args = ["pane", "split", "--pane", pane_id, "--direction", direction]
+        for key, value in (env or {}).items():
+            args += ["--env", f"{key}={value}"]
+        res = self._run(*args)
         pane = (res.get("pane") or res)
         new_id = str(pane.get("pane_id") or "")
         if not new_id:

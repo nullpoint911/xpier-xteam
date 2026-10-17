@@ -34,6 +34,7 @@
   rt/                   review-tree 钉出来的快照树（交付提交的只读副本，片闭合自动清）
   session.json         xteam up 写的会话记录（workspace / pane 映射）
   team.json            角色用的 agent / model（可选，up 自动落盘）
+  teams.json           这个项目有哪些 team（没有它就是单 team）
   identity/            <角色>.md：身份文件（挂进系统提示词，重置清不掉）
   watch/               巡检状态与事件
 ```
@@ -215,6 +216,46 @@ xteam say <role> "<短消息，一两句话指路>"
   `agent prompt` 自带的那次回车不提交它。`say` 会自动补一次回车；补了仍提交不了会
   明说「已投但没提交」并返回非 0（别当成功）。
 - 角色名（`pm`/`tl`/`dev`）是唯一寻址物，**不要用 pane_id**——它跨 workspace 会重复。
+
+## 一个 PM 管 N 组（多 team）
+
+默认是「一个项目 = 一套 pm/tl/dev」。`team add` 之后，一个 PM 底下可以挂 N 套 tl/dev，
+实现就能并行（设计取舍见 xteam 仓库的 `docs/一个PM管N个team.md`）。
+
+```bash
+xteam team add quick      # 起 quick 组的 tl/dev（幂等：已声明就只补起缺的角色）
+xteam team start quick    # 这一组被关掉之后，把它拉回来
+xteam team stop quick     # 只关角色 pane，workspace 与声明都留着
+xteam team list           # 每组在飞几片、tl/dev 在不在跑
+xteam team rm quick       # 撤销这个组（手上还有在飞的片就不许删）
+```
+
+**切片归哪一组，写在 `task.json` 的 `team` 里**（`spec.md` 的 front-matter
+`team: quick` 也认；两处都没写就算 `main`）：
+
+```json
+{"team": "quick"}
+```
+
+**漏写 `team` 的切片会算成 main 组。** 于是派给 quick 的活落在 main 的队列里，quick 的
+dev 一直收不到活、空转到最后 tl 自己动手 —— 这个错在同一个项目里复发过两次。所以
+**建切片时就把 `team` 写上，不要事后补**。
+
+派活指名到组：
+
+```bash
+xteam say --team quick dev "新任务：…"
+```
+
+**在子 team 的 pane 里，`--team` 可以不写。** xteam 起这些 pane 时注入了
+`XTEAM_TEAM=<组名>`，组里的 agent 跑 `xteam say dev` / `whoami` / `status` 时自动落在
+自己那一组。这比「要求 agent 记得加 `--team`」可靠 —— 人都会忘，何况上下文随时被清空
+的 agent。
+
+`xteam up .` 会把 `teams.json` 里声明的**每一组都拉起来**：声明就是「这个项目该有哪些
+组」，撤销它用 `team rm`。所以一组被关掉之后，`team start <组名>` 或再 `up` 一次都能回来。
+
+**PM 仍然只有一个，`verdict.json` 也只有一个作者** —— 能并行的是实现，门禁天然串行。
 
 ## 会话被重置之后（/new、/clear、压缩）
 

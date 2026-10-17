@@ -137,6 +137,42 @@ xteam review-tree <slug>  # TL/PM 在交付提交的只读快照树里 review/ga
 `sync` 存在的理由：角色章程是 `up` 时一次性投进 pane 的。你之后改了 xteam 的规则，
 正在跑的 pane 拿到的还是旧的——`sync` 重投并刷新 `.xteam/PROTOCOL.md`，不必重启整套。
 
+## 一个 PM 管 N 组（多 team）
+
+默认一个项目 = 一套 pm/tl/dev，实现只能串行。加一组就多一套 tl/dev，实现能并行 ——
+**PM 仍然只有一个**（它是唯一裁决者，`verdict.json` 只有一个作者，门禁天然串行）。
+设计与取舍见 [一个 PM 管 N 个 team](docs/一个PM管N个team.md)。
+
+```bash
+xteam team add quick       # 起 quick 组（幂等：已声明就只补起缺的角色）
+xteam team list            # 每组在飞几片、tl/dev 在不在跑
+xteam team start quick     # 这一组被关掉之后，把它拉回来
+xteam team stop quick      # 只关角色 pane，workspace 与声明都留着
+xteam team rm quick        # 撤销这个组（手上有在飞的片就不许删）
+```
+
+**切片归哪一组，写 `task.json` 的 `team`**（`spec.md` 的 front-matter 也认）：
+
+```json
+{"team": "quick"}
+```
+
+漏写就是 `main` —— 派给 quick 的活会落进 main 的队列，quick 的 dev 一直空转，最后活砸在
+它的 tl 自己身上。**这个错在真实项目里复发过两次，别靠记得，靠一开始就写。**
+
+派活指名到组，组名你也可以不写：
+
+```bash
+xteam say --team quick dev "新任务：…"   # 在人这个 pane 里：要指名
+xteam say dev "新任务：…"                # 在 quick 的 pane 里：XTEAM_TEAM 已注入，自动落回本组
+```
+
+组里的 pane 都带 `XTEAM_TEAM=<组名>`，所以组里的 agent 说 `say dev` / `whoami` / `status`
+时自动落在自己那一组 —— 不靠它记得加 `--team`。项目级命令（`up`/`down`/`restore`）不受它影响。
+
+`xteam up .` 会把 `teams.json` 里声明的每一组都拉起来（声明 = 「这个项目该有哪些组」，
+撤销用 `team rm`），所以一组被关掉之后，`team start` 或再 `up` 一次都能回来。
+
 ## 解锁重叠：dev 交付后不等 gate
 
 原来「交付 → 判定」之间整棵产品树是冻结的：gate 必须判在一棵可归因的树上，于是
@@ -319,6 +355,7 @@ agent 干活常停在「要授权吗」的框上（写 /tmp、跑测试、开端
 | `xteam update` | 查上游有没有新版本（**不自动升级**） |
 | `xteam restore` | 关掉后从 `.xteam` 恢复现场（数据从不删除） |
 | `xteam down` | 收摊：**只关角色 pane，workspace 保留**（下次 up 直接复用） |
+| `xteam team list\|add\|start\|stop\|rm` | 一个 PM 管 N 组 tl/dev：加组 / 关掉后重启 / 停 / 撤销 |
 
 每个子命令都有 `--help`。下面几篇讲清楚各自的取舍：
 

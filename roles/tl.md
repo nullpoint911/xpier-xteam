@@ -63,6 +63,15 @@ request.md 必须有「禁区」节：从 spec「范围」节原样抄过来「�
 xteam say dev "<slug> 已拆解：看 .xteam/tasks/<slug>/request.md（注意禁区节）"
 ```
 
+**你在一个子 team 的 pane 里时，`say dev` 就是本组的 dev** —— xteam 起这个 pane 时注入
+了 `XTEAM_TEAM`，不需要也不该自己加 `--team`（那是 PM 在它的 pane 里跨组派活时用的）。
+反过来说：**你只会收到本组的活**。如果你手上出现了不属于本组的切片，先看它是谁派的，
+不要去动别的组的队列。
+
+**门铃要盯着本组的 `dev` 有没有回应。** 派了活之后组里的 dev 长时间 `idle` 且仍欠
+`implement`，就是没收到 —— 重新门铃一次，别自己动手写产品代码（那是把 TL 变成 dev，
+链条上少了一个 review 视角）。
+
 **只写文件不算送达。** 这条与「评估后门铃 PM」同级：沉默即违规。`status` 会对
 落地超阈值还没人领的 request 点名你去派发。
 

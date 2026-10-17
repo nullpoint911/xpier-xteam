@@ -1211,6 +1211,20 @@ def cmd_restore(args: argparse.Namespace) -> int:
     else:
         print("  尚无 recap —— 下次切片闭合时 xteam 会主动要求写")
     print()
+    # 子 team 是「声明了就该回来」的东西：workspace 关掉之后要有一条明确的路，
+    # 否则人只能猜（实测就是「关闭 sub team 后无法重启」）。
+    subs = [t for t in read_teams(root, label) if t["name"] != DEFAULT_TEAM]
+    if subs:
+        print("  子 team（teams.json 里声明的）:")
+        for t in subs:
+            tlabel = str(t.get("label") or f"{label}-{t['name']}")
+            tws = Herdr(scope=tlabel).find_workspace(tlabel)
+            state_t = (f"运行中（{len(Herdr(scope=tlabel).role_map(tws['workspace_id']))} 个 agent）"
+                       if tws else "没在跑")
+            print(f"    {t['name']:<10} {tlabel:<16} {state_t}")
+        print(f"  拉起某一组：xteam --project {root} team start <组名>"
+              f"（或 xteam up . 一次全起）")
+        print()
     if not ws:
         print("  恢复现场：xteam up . --watch")
     return 0
@@ -1272,6 +1286,60 @@ def resolve_ws_label(root: Path, explicit: str | None,
                 f"cwd 反查有并列（{'、'.join(tied)}），取 xteam 角色最多的"
                 f"（{best_n} 个）；要指定用 --workspace")
     return hits[0][0], f"cwd 反查命中（{hits[0][0]}）"
+
+
+# 这些子命令是**agent 在 pane 里替自己说话**用的（门铃 / 打卡 / 自述 / 看状态）——
+# 它们必须落在「我这个 pane 属于哪一组」上。项目级生命周期命令（up/down/restore/
+# watch/sync）不进这张表：它们是整套现场的命令，不该因为人在哪个 pane 里而变。
+TEAM_SCOPED_CMDS = frozenset({"say", "stamp", "whoami", "status", "board",
+                              "reopen", "swap"})
+
+
+def _team_env_label(root: Path, team: str) -> str:
+    """`XTEAM_TEAM` 指的组在 teams.json 里的 workspace label（查不到返回空串）。"""
+    if not team or not root.is_dir():
+        return ""
+    try:
+        hit = [t for t in read_teams(root, "") if t["name"] == team]
+    except Exception:                            # noqa: BLE001
+        return ""
+    if not hit:
+        return ""
+    return str(hit[0].get("label") or f"{root.name}-{team}")
+
+
+def default_workspace(args: argparse.Namespace) -> str:
+    """**本次要用哪个 workspace**（返回值即最终值，不含「已给就不覆盖」的半条规则）。
+
+    三条来源，顺序即优先级：
+
+    0. **显式 `--workspace`**。人说了算，永远最大 —— 这条必须在这里，不能只留在
+       `main()` 的 `if not args.workspace` 里：规则的唯一住处才是不会漂的地方，
+       而多一处调用点忘了加判断，就会把人明确指定的 workspace 悄悄覆盖成目录名。
+
+    1. **`XTEAM_TEAM`：pane 里注入的「我属于哪一组」**。子 team 的 pane 起的 agent
+       必须能找到自己那一组，否则它说的每一句话都落到主组：quick 的 tl 跑
+       `xteam say dev`，workspace 由 cwd 反查/目录名算出来 = 主组，门铃投给
+       **main 的 dev**，而 quick 的 dev 永远收不到派工，最后只能 tl 自己动手
+       （apartment 实测就是这么空转的）。README 里的「派活：xteam say --team X dev」
+       要求 agent 自己记得加 --team —— 人都会忘，何况上下文随时被清空的 agent。
+       环境变量是 pane 自己的事实，不靠它自觉。
+
+    2. **项目目录名**。`--project` 指到哪就用哪个目录名。原来除 `up` 之外一律取
+       **当前 shell 的 cwd**，于是 `xteam --project /a/b status` 在别的目录里跑会
+       去解析 cwd 那个项目的 workspace，直接报「不属于本项目」（实测可复现）。
+    """
+    if args.workspace:
+        return args.workspace
+    project = Path(args.project or ".")
+    team = os.environ.get("XTEAM_TEAM", "").strip()
+    if team and args.cmd in TEAM_SCOPED_CMDS:
+        env_label = _team_env_label(project, team)
+        if env_label:
+            return env_label
+    # `up` 的目录参数在 parse 之后才合并进 args.project，所以这里读到的仍是
+    # 显式 --project 或默认值 —— 与改动前的行为逐字相同。
+    return project.resolve().name
 
 
 def started_order(args: argparse.Namespace) -> list[str]:
@@ -1718,6 +1786,12 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
     """
     herdr = Herdr(scope=label)
     existing = herdr.find_workspace(label)
+    # 我们自己刚建的 workspace 里，herdr 会**顺手附一个 tab**（一个裸 shell）。
+    # 那个 tab 我们永远不用：split 模式另外建组自己的 tab，非 split 模式每个
+    # 角色一个 tab —— 于是它留在屏幕上就是一块没人用的空白面板（人看到会问
+    # 「这是什么」）。记下它，等角色就位后收掉。**只在「这个 workspace 是我们
+    # 刚建的」时记**：别人的 workspace、或既有 tab 一律不动。
+    blank_tabs: list[str] = []
     if existing:
         # **复用 workspace，不要再开一个。** 反复 up 会在屏幕上堆一堆同名
         # workspace，而它们指向同一个项目 —— 既浪费终端空间，又让人搞不清
@@ -1733,6 +1807,12 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
         if not ws_id:
             die(f"workspace 创建返回异常（未找到 workspace_id）：{ws}")
         say(f"[{now()}] workspace {label!r} → {ws_id}")
+        try:
+            blank_tabs = [str(t.get("tab_id") or "") for t in
+                          herdr._run("tab", "list",
+                                     "--workspace", ws_id).get("tabs", [])]
+        except Exception:                        # noqa: BLE001
+            blank_tabs = []      # 问不到就不收：宁留一块空白，也不猜着关 tab
 
     live_roles = {r: a for r, a in
                   herdr.role_map(ws_id).items() if r in BOOT_ORDER}
@@ -1766,13 +1846,20 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
         say(f"[{now()}] 启动 {role}（{spec.cn}）：{spec.describe() or 'CLI 默认模型'}",
             flush=True)
         if split:
+            # 这一组的 pane 都要带上 XTEAM_TEAM：`xteam say dev` 靠它认出「我在
+            # 哪一组」，否则子 team 的门铃会按 cwd/目录名落到主组去（见
+            # default_workspace）。tab 级 env 只作用于 tab 的第一个 pane，所以
+            # 下面分割出来的 pane 必须自己再带一遍。
+            pane_env = {"XTEAM_ROLE": role}
+            if team:
+                pane_env["XTEAM_TEAM"] = team
             if not split_tab:
                 if base_tab and base_pane:
                     # 同组还有存活的 pane：接着用它，保持一个 tab
                     split_tab, split_pane, split_pane_busy = base_tab, base_pane, True
                 else:
                     tab = herdr.create_tab(ws_id, str(root), team or label,
-                                           env={"XTEAM_ROLE": role})
+                                           env=pane_env)
                     split_tab = (tab.get("tab") or tab).get("tab_id", "")
                     panes = herdr.panes_of_tab(ws_id, split_tab)
                     if not panes:
@@ -1783,7 +1870,7 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
             # pane 上**：测试先抓到（tl/dev 都落在 w1:p1），真机上就是两个 agent
             # 挤同一个 shell。
             if split_pane_busy:
-                split_pane = herdr.split_pane(split_pane, "right")
+                split_pane = herdr.split_pane(split_pane, "right", env=pane_env)
             pane_id, tab_id = split_pane, split_tab
             herdr.start_agent(pane_id, tab_id, spec)
             split_pane_busy = True      # 这个 pane 现在有主了
@@ -1804,6 +1891,20 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
         used.setdefault(role, agent_rec.get("agent") or
                         (specs[role].describe() if role in specs else "") or
                         "CLI 默认模型")
+
+    # 收掉 workspace 创建时附带的空 tab。**只在它确实没被我们用上时**才关：
+    # own_tabs 为空说明这个 workspace 里一个自己的 tab 都没有，那就留着那块
+    # 空白（宁可难看，也不能把一个 workspace 关成零个 tab）。
+    own_tabs = {t for t in tabs_of.values() if t}
+    if own_tabs:
+        for tab_id in blank_tabs:
+            if not tab_id or tab_id in own_tabs:
+                continue
+            try:
+                herdr.close_tab(tab_id)
+                say(f"[{now()}] 收掉 workspace 自带的空 tab（{tab_id}）")
+            except Exception as exc:             # noqa: BLE001
+                say(f"[{now()}] ⚠ 收空 tab {tab_id} 失败（不影响角色）：{exc}")
 
     # 角色章程：PM 先收到（它是入口），再 TL，最后 dev。
     #
@@ -1935,7 +2036,33 @@ def cmd_up(args: argparse.Namespace) -> int:
     print(f"\n[{now()}] 启动完成。角色：{', '.join(boot['started'])}")
     for role, agent in boot["agents"].items():
         print(f"  {role:<6} → {agent}")
-    print(f"  看状态：xteam status    门铃：xteam say <role> \"...\"")
+
+    # **已声明的子 team 一起恢复。** teams.json 就是「这个项目该有哪些组」这一
+    # 声明，`team rm` 才是撤销它的动作——所以关掉之后再 up 一次就该全回来。
+    # 原来 up 只起 main：子 team 的 workspace 被关之后**没有任何命令能把它拉回来**
+    # （team add 硬失败在「已存在」），这就是「关闭 sub team 后无法重启」。
+    # 单 team 项目这里空转，输出与以前逐字相同。
+    subteams = [t for t in read_teams(root, label) if t["name"] != DEFAULT_TEAM]
+    for t in subteams:
+        tname = str(t["name"])
+        tlabel = str(t.get("label") or f"{label}-{tname}")
+        print(f"\n[{now()}] 子 team {tname!r}（{tlabel}）")
+        # 一个组起不来（agent 没装、pane 起不来）不该把已经起好的 main 也算失败，
+        # 更不该在 main 已就位后让整个 up 回滚——所以这里就地接住，逐组报。
+        try:
+            t_out = _bring_up_team(root, proto, tname, tlabel)
+        except (RuntimeError, SystemExit) as exc:
+            print(f"  ⚠ 起不来：{exc}", file=sys.stderr)
+            print(f"    单组重试：xteam --project {root} team start {tname}",
+                  file=sys.stderr)
+            continue
+        for role, pane_id in t_out["started"].items():
+            print(f"  {role:<6} → {pane_id}")
+
+    print(f"\n  看状态：xteam status    门铃：xteam say <role> \"...\"")
+    if subteams:
+        print(f"  多 team 的派活：xteam say --team <组名> dev \"...\""
+              f"（切片要写 task.json 的 team 才归那组）")
     if args.watch:
         print(f"[{now()}] 拉起巡检 …")
         # workspace 必须一起传：cmd_watch 靠它定位 pidfile 和给子进程拼参数，
@@ -3000,6 +3127,18 @@ def cmd_intake(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _bring_up_team(root: Path, proto: Protocol, name: str, label: str) -> dict:
+    """把一个**已声明**的子 team 的 tl/dev 拉起来（workspace 在就复用、在跑的 pane 不动）。
+
+    `team add`（首次）与 `team start`（关掉之后重启）走同一条路——分叉的后果是
+    「新建的组」与「重启的组」行为迟早不一致，而那种不一致只在出事时才显形。
+
+    只拉 tl/dev：PM 仍然只有一个（它是唯一裁决者，也是人的替身）。
+    """
+    return bring_up_roles(root, proto, label, load_roles(root),
+                          only=["tl", "dev"], team=name, split=True)
+
+
 def cmd_team(args: argparse.Namespace) -> int:
     """多 team：一个 PM 底下挂 N 套 tl/dev。单 team 时这条命令只是查看。"""
     root = Path(args.project).resolve()
@@ -3017,6 +3156,7 @@ def cmd_team(args: argparse.Namespace) -> int:
     if args.team_action == "list":
         print(f"[{now()}] {len(teams)} 个 team（项目 {main_label!r}）")
         herdr = Herdr(scope=main_label)
+        down: list[str] = []
         for t in teams:
             name, label = t["name"], t.get("label") or main_label
             roles = []
@@ -3027,16 +3167,20 @@ def cmd_team(args: argparse.Namespace) -> int:
                     a = rm.get(r)
                     if a:
                         roles.append(f"{r}={a.get('agent_status', '?')}")
-            open_slices = [x.name for x in proto.open_tasks()
-                           if team_of(x) == name]
+            if not ws:
+                down.append(name)
             note = " · ".join(roles) if roles else "（tl/dev 没在跑）"
             d = team_digest(root, name)
-        print(f"  {name:<10} {note}"
+            print(f"  {name:<10} {note}"
                   + f" · 在飞 {d['counts']['open']} 片"
                   + (f"（实现中 {d['counts']['inflight']} · 待 gate {d['counts']['gate']}）"
                      if d["counts"]["open"] else ""))
         if len(teams) == 1:
             print("  （单 team —— `xteam team add <名字>` 起第二套 tl/dev）")
+        elif down:
+            # 只在**真有组没在跑**时才提这条。无条件印的话，两组都活着的人会被
+            # 支去敲一条没有必要的 team start（文档里的人是被文案领着走路的）。
+            print(f"  （{('、'.join(down))} 没在跑：`xteam team start <名字>` 拉回来）")
         return 0
 
     if args.team_action == "digest":
@@ -3047,31 +3191,42 @@ def cmd_team(args: argparse.Namespace) -> int:
             print(line)
         return 0
 
-    if args.team_action == "add":
+    if args.team_action in ("add", "start"):
         name = (args.name or "").strip()
         if not name:
-            die("team 名不能空：xteam team add <名字>")
+            die("要给组名：xteam team add <名字> / xteam team start <名字>")
         if name == DEFAULT_TEAM:
-            die(f"{DEFAULT_TEAM!r} 是默认组，不用 add")
-        if any(t["name"] == name for t in teams):
-            die(f"team {name!r} 已存在")
+            die(f"{DEFAULT_TEAM!r} 是默认组：起它用 `xteam up .`，不走 team add/start")
         if not name.replace("-", "").replace("_", "").isalnum():
             die(f"team 名只能用字母数字和 -_：收到 {name!r}")
-        label = f"{main_label}-{name}"
-        herdr = Herdr(scope=label)
-        if not herdr.find_workspace(label):
-            # 只拉 tl/dev：PM 仍然只有一个（它是唯一裁决者，也是人的替身）
-            out = bring_up_roles(root, proto, label, load_roles(root),
-                                 only=["tl", "dev"], team=name, split=True)
-            print(f"  team {name!r} 的 tl/dev 已起：{out['started']}")
+        declared = [t for t in teams if t["name"] == name]
+        if args.team_action == "start" and not declared:
+            die(f"没有 team {name!r}。现有：{'、'.join(t['name'] for t in teams)}"
+                f"（要新建：xteam team add {name}）")
+        label = ((declared[0].get("label") if declared else "")
+                 or f"{main_label}-{name}")
+        # **已声明的组不再当错误。** 「关掉之后想重启」的人敲的往往就是 add：
+        # 原来它硬失败在「已存在」，于是这个组再也起不回来（teams.json 里还在，
+        # workspace 却没了 —— 实测就是用户报的那个「关闭 sub team 后无法重启」）。
+        # 现在两条路都落到同一条幂等的 bring-up：还在跑的 pane 不动，缺的补起。
+        if declared:
+            print(f"  team {name!r} 已声明（{label}）—— 把它拉起来")
+        out = _bring_up_team(root, proto, name, label)
+        if not declared:
+            # split 记下来：board 组带要靠它标出「这组是分屏的」，人一眼能看到布局。
+            teams.append({"name": name, "label": label, "split": True})
+            write_teams(root, teams)
+            print(f"  已记入 {teams_path(root).relative_to(root)}"
+                  f"（切片写 team: {name} 就归这组干）")
         else:
-            print(f"  workspace {label!r} 已存在，直接收编")
-        # split 记下来：board 组带要靠它标出「这组是分屏的」，人一眼能看到布局。
-        teams.append({"name": name, "label": label, "split": True})
-        write_teams(root, teams)
-        print(f"  已记入 {teams_path(root).relative_to(root)}"
-              f"（切片写 team: {name} 就归这组干）")
-        print(f"  派活：xteam say --team {name} dev \"…\"")
+            declared[0]["label"] = label
+            declared[0]["split"] = True
+            write_teams(root, teams)
+        print(f"  tl/dev：{out['started']}")
+        # 「切片写 team 才归这组干」这句是踩过的坑（#52）：漏写的切片会算成 main，
+        # 于是这组的 dev 空转，活最后砸在 tl 自己身上。两条都点出来。
+        print(f"  派活：xteam say --team {name} dev \"…\""
+              f"（切片必须先写 task.json 的 team: {name}）")
         return 0
 
     if args.team_action == "rm":
@@ -3093,6 +3248,35 @@ def cmd_team(args: argparse.Namespace) -> int:
             print(f"  已关 workspace {label!r}")
         write_teams(root, [t for t in teams if t["name"] != name])
         print(f"  已从 {teams_path(root).relative_to(root)} 移除")
+        return 0
+
+    if args.team_action == "stop":
+        name = (args.name or "").strip()
+        if name == DEFAULT_TEAM:
+            die(f"{DEFAULT_TEAM!r} 组停不得（那是整个项目：用 xteam down）")
+        hit = [t for t in teams if t["name"] == name]
+        if not hit:
+            die(f"没有 team {name!r}")
+        label = hit[0].get("label") or f"{main_label}-{name}"
+        herdr = Herdr(scope=label)
+        ws = herdr.find_workspace(label)
+        if not ws:
+            print(f"[{now()}] {label!r} 没在跑（声明还在，`team start {name}` 拉回来）")
+            return 0
+        ws_id = ws["workspace_id"]
+        closed = []
+        for role, agent in herdr.role_map(ws_id).items():
+            tab = agent.get("tab_id")
+            if tab and _alive_pane_exists(herdr, ws_id, tab):
+                try:
+                    herdr.close_tab(tab)
+                    closed.append(role)
+                except Exception as exc:            # noqa: BLE001
+                    print(f"[{now()}] ⚠ 关 {role} 的 tab 失败：{exc}", file=sys.stderr)
+        print(f"[{now()}] 已停 {label!r}：关了 {len(closed)} 个角色 pane"
+              f"（{'、'.join(sorted(closed)) or '无'}）")
+        print(f"  workspace {label!r} ({ws_id}) **保留着**，声明也保留 ——"
+              f" 重启：xteam team start {name}")
         return 0
 
     die(f"未知 team 动作：{args.team_action}")
@@ -5205,8 +5389,10 @@ def main() -> int:
     p.set_defaults(func=cmd_intake)
 
     p = sub.add_parser("team", help="多 team：一个 PM 挂 N 套 tl/dev（单 team 时只是查看）")
-    p.add_argument("team_action", choices=["list", "add", "rm", "digest"])
-    p.add_argument("name", nargs="?", default="", help="add/rm 的 team 名")
+    p.add_argument("team_action",
+                   choices=["list", "add", "start", "stop", "rm", "digest"])
+    p.add_argument("name", nargs="?", default="",
+                   help="add/start/stop/rm 的 team 名")
     p.set_defaults(func=cmd_team)
 
     p = sub.add_parser("wiki", help="翻 wiki 沉淀（默认看最近的几条 → show 读全文）")
@@ -5359,11 +5545,11 @@ def main() -> int:
 
     check_assets()
     args = ap.parse_args()
-    # workspace 名只有一个来源：全局 --workspace，或项目目录名。子命令不再重复定义
+    # workspace 名只有一个来源：全局 --workspace，或（子 team 的 pane 里）
+    # 注入的 XTEAM_TEAM，或项目目录名。三者的优先级全在 default_workspace 里，
+    # 这里不再判「有没有给」—— 判两次就会有两份会漂的规则。子命令也不重复定义
     # 它，否则 `xteam --workspace foo up .` 会被子解析器的默认值静默覆盖成目录名。
-    if not args.workspace:
-        base = args.project if args.cmd == "up" and args.project else "."
-        args.workspace = Path(base).resolve().name
+    args.workspace = default_workspace(args)
     if args.version:
         print(f"xteam {_version()}")
         try:

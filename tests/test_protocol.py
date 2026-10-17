@@ -5090,7 +5090,9 @@ def test_team_split_one_pane() -> None:
         def panes_of_tab(self, ws_id, tab_id):
             return [f"w1:p{self.n}"]
 
-        def split_pane(self, pane_id, direction="right"):
+        # 签名必须与真实 Herdr.split_pane 一致（多一个 env 参数就 TypeError，
+        # 而这正是「子 team 的 pane 要各自带 XTEAM_TEAM」要走到的那条路）。
+        def split_pane(self, pane_id, direction="right", env=None):
             calls.append(("split", pane_id, direction))
             self.n += 1
             return f"w1:p{self.n}"
@@ -5266,7 +5268,8 @@ def test_split_bring_up_from_surviving_pane() -> None:
         def panes_of_tab(self, ws_id, tab_id):
             return ["w1:p1"]
 
-        def split_pane(self, pane_id, direction="right"):
+        # 同 [106]：签名跟真实 Herdr 对齐，否则补起角色时会 TypeError
+        def split_pane(self, pane_id, direction="right", env=None):
             calls.append(("split", pane_id, direction))
             return "w1:pNEW"
 
@@ -5326,6 +5329,469 @@ def test_split_bring_up_from_surviving_pane() -> None:
               [("tl", "w1:p1"), ("dev", "w1:pNEW")])
     finally:
         _cli.Herdr = orig
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_team_scoped_routing_and_restart() -> None:
+    """[132] 子 team 两个真实故障：门铃落错组（派活偏斜）与关掉后起不来（重启）。"""
+    print("\n[132] 子 team 路由（XTEAM_TEAM）与重启（team start / up 恢复）")
+    root = Path(tempfile.mkdtemp())
+    saved = os.environ.pop("XTEAM_TEAM", None)
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+        label = root.name
+        quick_label = f"{label}-quick"
+        write_teams(root, [{"name": "main", "label": label},
+                           {"name": "quick", "label": quick_label}])
+
+        # ---- A) 「我在哪一组」= pane 自己的环境变量，不靠 agent 记得 --team ----
+        def ws(cmd: str, team: str | None = None, workspace: str | None = None) -> str:
+            if team is None:
+                os.environ.pop("XTEAM_TEAM", None)
+            else:
+                os.environ["XTEAM_TEAM"] = team
+            return _cli.default_workspace(
+                argparse.Namespace(project=str(root), cmd=cmd, workspace=workspace))
+
+        check("子 team 的 pane 说 say → 落回自己那组",
+              ws("say", team="quick"), quick_label)
+        check("whoami/status/stamp/board 一样认 XTEAM_TEAM",
+              [ws(c, team="quick") for c in ("whoami", "status", "stamp", "board")],
+              [quick_label] * 4)
+        check("没注入 XTEAM_TEAM → 项目目录名（老行为）", ws("say"), label)
+        check("未登记的组名安全回落，不报错", ws("say", team="nope"), label)
+        check("显式 --workspace 仍然最大",
+              ws("say", team="quick", workspace="hand-made"), "hand-made")
+        # 项目级生命周期命令是「整套现场」的命令，不该因为人在哪个 pane 里而变
+        check("up 不受 XTEAM_TEAM 带偏", ws("up", team="quick"), label)
+        check("down 不受 XTEAM_TEAM 带偏", ws("down", team="quick"), label)
+
+        # ---- B) 起子 team 的 pane 必须把 XTEAM_TEAM 注进去（否则 A 收不到货） ----
+        calls: list = []
+
+        class SplitHerdr:
+            def __init__(self, scope: str = "") -> None:
+                self.scope = scope
+                self.n = 0
+
+            def find_workspace(self, label):
+                return None
+
+            def create_workspace(self, cwd, label):
+                return {"workspace": {"workspace_id": "w1"}}
+
+            def role_map(self, ws_id):
+                return {}
+
+            def create_tab(self, ws_id, cwd, label, env=None):
+                calls.append(("create_tab", label, env))
+                self.n += 1
+                return {"tab": {"tab_id": f"w1:t{self.n}"}}
+
+            def panes_of_tab(self, ws_id, tab_id):
+                return ["w1:p1"]
+
+            def split_pane(self, pane_id, direction="right", env=None):
+                calls.append(("split", pane_id, env))
+                return "w1:pNEW"
+
+            def start_agent(self, pane_id, tab_id, spec):
+                calls.append(("start", spec.role, pane_id))
+
+            def send_initial_prompt(self, pane_id, intro, wait_s=15):
+                return "ok"
+
+        specs = {"tl": RoleSpec("tl", "omp", "团队负责人", ""),
+                 "dev": RoleSpec("dev", "devin", "开发", "")}
+        orig = _cli.Herdr
+        _cli.Herdr = SplitHerdr
+        try:
+            _cli.bring_up_roles(root, proto, quick_label, specs,
+                                only=["tl", "dev"], say=lambda *_a, **_k: None,
+                                team="quick", split=True)
+            check("tab 的 env 带 XTEAM_TEAM（第一个 pane 靠它）",
+                  [c[2] for c in calls if c[0] == "create_tab"],
+                  [{"XTEAM_ROLE": "tl", "XTEAM_TEAM": "quick"}])
+            # herdr 的 tab 级 env 只管第一个 pane（实测），后裂出来的必须自己带
+            check("裂出来的 pane 自己再带一遍 env",
+                  [c[2] for c in calls if c[0] == "split"],
+                  [{"XTEAM_ROLE": "dev", "XTEAM_TEAM": "quick"}])
+        finally:
+            _cli.Herdr = orig
+
+        # ---- C) 已声明的组：关掉之后 `up` 一次就该全回来 ----
+        # teams.json 是「这个项目该有哪些组」的声明，team rm 才是撤销 ——
+        # 原来 up 只起 main，workspace 被关掉后没有任何命令能把它拉回来。
+        class UpHerdr:
+            workspaces: dict = {}
+            calls: list = []
+            tabs = 0
+            panes = 0
+            blank: set = set()      # herdr 的 workspace create 会附带的空 tab
+
+            def __init__(self, scope: str = "") -> None:
+                self.scope = scope
+                self.bin = sys.executable
+
+            def kinds_supported(self):
+                return None
+
+            def agent_installed(self, kind):
+                return True
+
+            def find_workspace(self, label):
+                return UpHerdr.workspaces.get(label)
+
+            def create_workspace(self, cwd, label):
+                ws_id = f"w{len(UpHerdr.workspaces) + 1}"
+                UpHerdr.workspaces[label] = {"workspace_id": ws_id}
+                UpHerdr.calls.append(("workspace", label))
+                # 真实 herdr 会顺手建一个 tab（一个裸 shell）—— 必须复现，否则
+                # 「收掉 workspace 自带的空 tab」那段永远测不到
+                UpHerdr.tabs += 1
+                blank = f"{ws_id}:t{UpHerdr.tabs}"
+                UpHerdr.blank.add(blank)
+                return {"workspace": {"workspace_id": ws_id}}
+
+            def role_map(self, ws_id):
+                return {}
+
+            def create_tab(self, ws_id, cwd, label, env=None):
+                UpHerdr.tabs += 1
+                UpHerdr.calls.append(("create_tab", label, env))
+                return {"tab": {"tab_id": f"{ws_id}:t{UpHerdr.tabs}"}}
+
+            def panes_of_tab(self, ws_id, tab_id):
+                UpHerdr.panes += 1
+                return [f"{ws_id}:p{UpHerdr.panes}"]
+
+            def split_pane(self, pane_id, direction="right", env=None):
+                UpHerdr.panes += 1
+                UpHerdr.calls.append(("split", env))
+                return f"{pane_id.split(':')[0]}:p{UpHerdr.panes}"
+
+            def start_agent(self, pane_id, tab_id, spec):
+                UpHerdr.calls.append(("start", spec.role))
+
+            def send_initial_prompt(self, pane_id, intro, wait_s=15):
+                return "ok"
+
+            def _run(self, *argv):
+                if argv[:2] == ("tab", "list"):
+                    ws_id = argv[-1]
+                    return {"tabs": [{"tab_id": t} for t in UpHerdr.blank
+                                     if t.startswith(ws_id)]}
+                return {}
+
+            def close_tab(self, tab_id):
+                UpHerdr.blank.discard(tab_id)
+                UpHerdr.calls.append(("close_tab", tab_id))
+
+        def up_ns() -> argparse.Namespace:
+            return argparse.Namespace(project=None, watch=False, reviewer=False,
+                                      set_model=None, set_agent=None,
+                                      allow_openrouter=False, workspace=None)
+
+        orig = _cli.Herdr
+        _cli.Herdr = UpHerdr
+        try:
+            UpHerdr.workspaces, UpHerdr.calls = {}, []
+            UpHerdr.tabs = UpHerdr.panes = 0
+            UpHerdr.blank = set()
+            ns = up_ns()
+            ns.project = str(root)
+            rc = _cli.cmd_up(ns)
+            check("up 成功返回 0", rc, 0)
+            check("main 组照旧起（pm/tl/dev）",
+                  sorted(c[1] for c in UpHerdr.calls
+                         if c[0] == "create_tab" and c[1] in ("pm", "tl", "dev")),
+                  ["dev", "pm", "tl"])
+            main_env = [c[2] for c in UpHerdr.calls
+                        if c[0] == "create_tab" and c[1] in ("pm", "tl", "dev")]
+            check("main 组的 pane 不带 XTEAM_TEAM（它本来就是主组）",
+                  any(e and "XTEAM_TEAM" in e for e in main_env), False)
+            # 这就是「关闭 sub team 后无法重启」的正面用例：workspace 没了，
+            # 声明还在 —— up 必须把 quick 那一组拉回来，且是带 XTEAM_TEAM 起的。
+            check("up 顺带把声明的 quick 组拉起来",
+                  [c[1] for c in UpHerdr.calls if c[0] == "workspace"],
+                  [label, quick_label])
+            check("quick 的 pane 带 XTEAM_TEAM=quick",
+                  [e for e in [c[2] for c in UpHerdr.calls if c[0] == "create_tab"]
+                   if e and e.get("XTEAM_TEAM") == "quick"],
+                  [{"XTEAM_ROLE": "tl", "XTEAM_TEAM": "quick"}])
+            check("quick 组的 dev 从同组 pane 裂出、env 也带全",
+                  [e for e in [c[1] for c in UpHerdr.calls if c[0] == "split"]
+                   if e and e.get("XTEAM_TEAM") == "quick"],
+                  [{"XTEAM_ROLE": "dev", "XTEAM_TEAM": "quick"}])
+            check("session.json 记下 main 的三个 pane",
+                  sorted(json.loads((proto.dir / "session.json").read_text(
+                      encoding="utf-8"))["panes"]), ["dev", "pm", "tl"])
+            # herdr 的 workspace create 会附一个裸 shell tab，xteam 永远不用它 ——
+            # 留在屏幕上就是一块空白面板（人看到会问「这是什么」）。两个新 workspace
+            # 各收掉一个，且不能重复关同一个。
+            closed = [c[1] for c in UpHerdr.calls if c[0] == "close_tab"]
+            check("每个新 workspace 的空 tab 都被收掉（main 与 quick 各一个）",
+                  (len(closed), len(set(closed))), (2, 2))
+            check("收完之后没有遗留空 tab", UpHerdr.blank, set())
+
+            # 单 team 项目：一个新目录、没有 teams.json —— 新增段落必须全部空转，
+            # 输出与行为跟改动前一样（既有项目里绝大多数是这一种）。
+            plain = Path(tempfile.mkdtemp())
+            try:
+                Protocol(plain).ensure()
+                UpHerdr.workspaces, UpHerdr.calls = {}, []
+                UpHerdr.tabs = UpHerdr.panes = 0
+                UpHerdr.blank = set()
+                ns = up_ns()
+                ns.project = str(plain)
+                rc = _cli.cmd_up(ns)
+                check("单 team up 也返回 0", rc, 0)
+                check("单 team 不多建 workspace",
+                      [c[1] for c in UpHerdr.calls if c[0] == "workspace"],
+                      [plain.name])
+                check("单 team 没有任何 pane 带 XTEAM_TEAM",
+                      [e for e in [c[2] for c in UpHerdr.calls
+                                   if c[0] == "create_tab"]
+                       if e and "XTEAM_TEAM" in e], [])
+                check("单 team 项目读出来只有 main",
+                      [t["name"] for t in read_teams(plain, plain.name)], ["main"])
+                check("单 team 的空 tab 也收掉（不留空白面板）",
+                      [c[1] for c in UpHerdr.calls if c[0] == "close_tab"], ["w1:t1"])
+            finally:
+                shutil.rmtree(plain, ignore_errors=True)
+        finally:
+            _cli.Herdr = orig
+
+        # ---- D) 人敲的那几条命令：team add / start / stop / list / rm ----
+        # 报的第二个故障是「关闭 sub team 后无法重启该 team」。它的现场是：
+        # workspace 被关掉，teams.json 里声明还在，而 `team add` 硬失败在
+        # 「已存在」—— 于是没有任何一条命令能把这一组拉回来。
+        import contextlib
+        import io
+
+        class TeamHerdr:
+            """一份会变的现场：workspace 关掉就真没了，tab 也能被关。"""
+
+            live: dict = {}          # label -> {"workspace_id": str}
+            tabs: set = set()
+            blank: set = set()       # herdr 的 workspace create 附带的空 tab
+            seq = 0
+            opened: list = []
+
+            def __init__(self, scope: str = "") -> None:
+                self.scope = scope
+
+            def detect_by_cwd(self, root):
+                # 临时目录不在任何 workspace 的 pane 里 → 走「目录名」兜底
+                return []
+
+            def find_workspace(self, label):
+                ws = TeamHerdr.live.get(label)
+                if not ws:
+                    return None
+                return dict(ws, label=label)
+
+            def create_workspace(self, cwd, label):
+                TeamHerdr.seq += 1
+                ws_id = f"w{TeamHerdr.seq}"
+                TeamHerdr.live[label] = {"workspace_id": ws_id}
+                TeamHerdr.opened.append(label)
+                # 真实 herdr 会顺手附一个 tab（裸 shell）—— 复现它，否则
+                # 「收掉空 tab」这段测不到
+                TeamHerdr.seq += 1
+                blank = f"{ws_id}:t{TeamHerdr.seq}"
+                TeamHerdr.tabs.add(blank)
+                TeamHerdr.blank.add(blank)
+                return {"workspace": {"workspace_id": ws_id}}
+
+            def close_workspace(self, ws_id):
+                for label, ws in list(TeamHerdr.live.items()):
+                    if ws["workspace_id"] == ws_id:
+                        del TeamHerdr.live[label]
+
+            def role_map(self, ws_id):
+                return {}
+
+            def create_tab(self, ws_id, cwd, label, env=None):
+                TeamHerdr.seq += 1
+                tab = f"{ws_id}:t{TeamHerdr.seq}"
+                TeamHerdr.tabs.add(tab)
+                TeamHerdr.opened.append(("tab", label, env))
+                return {"tab": {"tab_id": tab}}
+
+            def panes_of_tab(self, ws_id, tab_id):
+                return [f"{tab_id}:p1"]
+
+            def split_pane(self, pane_id, direction="right", env=None):
+                return f"{pane_id}:p2"
+
+            def start_agent(self, pane_id, tab_id, spec):
+                TeamHerdr.opened.append(("agent", spec.role))
+
+            def send_initial_prompt(self, pane_id, intro, wait_s=15):
+                return "ok"
+
+            def close_tab(self, tab_id):
+                TeamHerdr.tabs.discard(tab_id)
+                TeamHerdr.blank.discard(tab_id)
+                TeamHerdr.opened.append(("close_tab", tab_id))
+
+            def _run(self, *argv):
+                if argv[:2] == ("tab", "list"):
+                    ws_id = argv[-1]
+                    return {"tabs": [{"tab_id": t} for t in TeamHerdr.tabs
+                                     if t.startswith(ws_id)]}
+                return {}
+
+        def team_ns(action: str, name: str | None = None) -> argparse.Namespace:
+            return argparse.Namespace(project=str(root), team_action=action,
+                                      name=name, workspace=None)
+
+        def ws_of(label: str):
+            """这个 label 的 workspace 现在还在吗（按簇现行状态问）。"""
+            return TeamHerdr(scope="probe").find_workspace(label)
+
+        def run_team(action: str, name: str | None = None) -> tuple[int, str]:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = _cli.cmd_team(team_ns(action, name))
+            return rc, buf.getvalue()
+
+        orig = _cli.Herdr
+        _cli.Herdr = TeamHerdr
+        try:
+            # 起点：只有 main，没有 teams.json
+            TeamHerdr.live, TeamHerdr.tabs = {}, set()
+            TeamHerdr.blank = set()
+            TeamHerdr.seq = 0
+            TeamHerdr.opened = []
+            (proto.dir / "teams.json").unlink(missing_ok=True)
+
+            check("没有 teams.json 时只有 main", [t["name"] for t in read_teams(root, label)],
+                  ["main"])
+
+            # add：新建一组（split 一个 tab 两半）
+            TeamHerdr.opened = []
+            rc, out = run_team("add", "quick")
+            check("team add 返回 0", rc, 0)
+            teams = read_teams(root, label)
+            check("team add 记进 teams.json", [t["name"] for t in teams],
+                  ["main", "quick"])
+            check("新组标了 split（看板靠它画布局）",
+                  [t.get("split") for t in teams if t["name"] == "quick"], [True])
+            check("label 是 <主组>-<组名>",
+                  [t["label"] for t in teams if t["name"] == "quick"],
+                  [f"{label}-quick"])
+            check("add 顺手把 tl/dev 起了",
+                  sorted(r for r in ("tl", "dev") if ("agent", r) in TeamHerdr.opened),
+                  ["dev", "tl"])
+            check("add 的提示里点名「切片要写 team」（#52 那个坑）",
+                  "task.json 的 team" in out, True)
+            # 建 workspace 时附带的那块空白面板要被收掉 —— 全屏看板上它就是一块
+            # 没主的 pane，人第一反应是「这是什么」
+            check("team add 收掉 workspace 自带的空 tab（不留空白面板）",
+                  TeamHerdr.blank, set())
+            check("收完之后组自己那个 tab 还在", len(TeamHerdr.tabs), 1)
+
+            # **重复 add 不再是硬错误** —— 这正是用户报的「关掉之后起不来」：
+            # 想重启的人敲的就是 add，而原来它死在这里。
+            TeamHerdr.opened = []
+            rc, out = run_team("add", "quick")
+            check("重复 team add 返回 0（不再 die 已存在）", rc, 0)
+            check("重复 add 不产生第二行声明",
+                  [t["name"] for t in read_teams(root, label)], ["main", "quick"])
+            check("重复 add 会明说是「已声明，把它拉起来」",
+                  "已声明" in out, True)
+
+            # 关掉（模拟人在 herdr 里把这一组的 workspace 关了）
+            TeamHerdr.live.pop(f"{label}-quick", None)
+            check("关掉后 workspace 真没了", ws_of(f"{label}-quick"), None)
+            check("但声明还在（teams.json 就是「该有哪些组」）",
+                  [t["name"] for t in read_teams(root, label)], ["main", "quick"])
+
+            # **重启**：两条路都必须能拉回来
+            TeamHerdr.opened = []
+            rc, _out = run_team("start", "quick")
+            check("关掉后 team start 返回 0", rc, 0)
+            check("team start 把 workspace 重新建出来",
+                  f"{label}-quick" in TeamHerdr.live, True)
+            check("重启的 pane 仍带 XTEAM_TEAM（否则重启后门铃又落错组）",
+                  [e for _, lbl, e in
+                   [x for x in TeamHerdr.opened if x[0] == "tab"] if e],
+                  [{"XTEAM_ROLE": "tl", "XTEAM_TEAM": "quick"}])
+
+            # 未声明的组 start 要报错（而不是悄悄新建一个）
+            try:
+                run_team("start", "ghost")
+                check("start 未声明的组应当报错", "没报错", "SystemExit")
+            except SystemExit:
+                check("start 未声明的组报错", "SystemExit", "SystemExit")
+
+            # list：**两个组都要印出来**（原来 print 缩进错位，只印最后一个）
+            TeamHerdr.live[f"{label}-quick"]["workspace_id"] = "wQ"
+            TeamHerdr.tabs.add("wQ:tQ")
+            rc, out = run_team("list")
+            check("team list 返回 0", rc, 0)
+            check("team list 印出 main", "main" in out, True)
+            check("team list 印出 quick（不再只印最后一个）", "quick" in out, True)
+            check("team list 说清共几个组", "2 个 team" in out, True)
+            # 这时 main 的 workspace 不在 → 提示必须**点名是哪一组**
+            hint = [ln for ln in out.splitlines() if "没在跑：" in ln]
+            check("有组没在跑时给出重启提示并点名",
+                  bool(hint) and "main" in hint[0], True)
+            # 两组都活着 → **不该**再提这条：无条件印的话，一切正常的人会被支去
+            # 敲一条没有必要的 team start
+            TeamHerdr.live[label] = {"workspace_id": "wM"}
+            _rc, out = run_team("list")
+            check("两组都在跑时不提「没在跑」", "没在跑：" in out, False)
+
+            # stop：关角色 tab，**workspace 与声明都保留**
+            rc, out = run_team("stop", "quick")
+            check("team stop 返回 0", rc, 0)
+            check("stop 之后 workspace 还在",
+                  f"{label}-quick" in TeamHerdr.live, True)
+            check("stop 之后声明还在",
+                  [t["name"] for t in read_teams(root, label)], ["main", "quick"])
+            check("stop 的提示指向 team start", "team start" in out, True)
+            # 复用已有 workspace 时**一个 tab 都不碰**：那块「看起来空白」的可能是
+            # 人自己开的 shell（apartment 的 main 组里就有 Monitor / web 两个）。
+            TeamHerdr.tabs.add("wQ:tUSER")
+            check("stop 过再 start 能回来", run_team("start", "quick")[0], 0)
+            check("复用 workspace 时不动别人的 tab",
+                  "wQ:tUSER" in TeamHerdr.tabs, True)
+
+            # rm：撤销声明，并且**有在飞的片就不许删**
+            t = proto.tasks / "api-side"
+            t.mkdir(parents=True, exist_ok=True)
+            (t / "task.json").write_text('{"team": "quick"}', encoding="utf-8")
+            try:
+                run_team("rm", "quick")
+                check("有在飞的片时 rm 应当报错", "没报错", "SystemExit")
+            except SystemExit:
+                check("有在飞的片时 rm 报错（不静默丢活）",
+                      "quick" in [x["name"] for x in read_teams(root, label)], True)
+            (t / "task.json").unlink()
+            rc, _out = run_team("rm", "quick")
+            check("清掉在飞片后 rm 返回 0", rc, 0)
+            check("rm 后声明没了", [x["name"] for x in read_teams(root, label)], ["main"])
+            check("rm 后 workspace 也关了", ws_of(f"{label}-quick"), None)
+
+            # main 组不参与 add/start/stop/rm
+            for action, why in (("start", "起它用 xteam up"),
+                                ("stop", "整个项目用 xteam down")):
+                try:
+                    run_team(action, "main")
+                    check(f"team {action} main 应当报错", "没报错", "SystemExit")
+                except SystemExit:
+                    check(f"team {action} main 被挡住", "SystemExit", "SystemExit")
+        finally:
+            _cli.Herdr = orig
+    finally:
+        if saved is not None:
+            os.environ["XTEAM_TEAM"] = saved
+        else:
+            os.environ.pop("XTEAM_TEAM", None)
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -5440,6 +5906,7 @@ def main() -> int:
         test_team_split_one_pane,
         test_external_review_fixes,
         test_split_bring_up_from_surviving_pane,
+        test_team_scoped_routing_and_restart,
     ):
         fn()
     print()
