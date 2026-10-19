@@ -226,13 +226,21 @@ dev 交付完只能干等（本仓 24 片实测：这段每片 3–12m、中位 
 两件事没变：**看板不新增事实来源**（状态只在 `.xteam/` 与 pane 里），**`verdict.json`
 仍只有 PM 一个作者**—— 外部评审只是给 PM 多一个视角。
 
+**队列顺序就是执行顺序**：`QUEUE.md` 的 `序` 是 PM 维护的看板，TL 只提议切片，
+入列/排序/改状态都归 PM。切片闭合后 PM 直接取队首，不再让 agent 另写 recap 交接 ——
+现状由 `QUEUE.md`、`tasks/<slug>/` 工件和 `git log` 现算。
+
+**PM/TL 讨论时，dev 不应该空转**：开始写 spec / 评估前先跑 `xteam whoami`，
+看到「可立即派给 dev」就先门铃派出去，再进入讨论。dev 做切片 N 时，PM/TL 准备
+N+1 的 spec / request；ready 缓冲至少保持一片。
+
 ## 升级 xteam 之后，正在跑的 agent 怎么跟上
 
 xteam **不是常驻进程**，所以它不会在任何时刻「知道」自己变了。于是三件事分开做：
 
 | 谁变了 | 怎么让正在跑的 agent 知道 |
 |---|---|
-| 角色章程 | `sync` **重投全文** —— 规则要重新通读，摘一句摘要等于让它拿旧理解做事 |
+| 角色核心卡 | `sync` **重投核心卡**；完整章程只给路径，需要细节时再读 |
 | 协议 / 输出规范（`skills/`） | `sync` **只给文件路径**，让它自己重读。全文很长，塞进来只会把真正的变更淹掉 |
 | 新增子命令（工具能力） | `sync` **只告知有哪几个新命令**，不重投章程 —— 它跑 `xteam <cmd> --help` 就拿得到 |
 
@@ -246,21 +254,23 @@ xteam **不是常驻进程**，所以它不会在任何时刻「知道」自己�
 ## 上下文重置（/new、/clear）之后，身份不丢
 
 长跑里 context 一定会满，而 `/new` / `/clear` 之后 agent **不该变成陌生人**。
-xteam 把两件事分开存：**身份**放系统提示词，**现状**放文件。
+xteam 把两件事分开存：**身份核心卡**放系统提示词，**现状**放文件。
 
 | 你可能做的事 | 会发生什么 |
 |---|---|
 | 在 pane 里敲 `/new` 或 `/clear` | 身份仍在（见下）；下一条消息它会先跑 `xteam whoami` 把现状读回来 |
-| `xteam reopen pm` | 计划内的重开：先要 recap → `/new` → 身份与现状自动投回，**pane 和进程都不换** |
+| `xteam reopen pm` | 计划内的重开：`/new` → 按 `QUEUE.md` 与工件现算的现状自动投回，**pane 和进程都不换** |
 | `xteam swap pm` | 换的是**进程**（能换 kind/model）；任何 kind 都能用，代价是重建 pane |
 | context 涨到 75% | 巡检落事件 + 响通知，建议你 `xteam reopen <角色>`（**不自动重开**：丢不丢对话里没落文件的推理，由你判断） |
 
 身份为什么清不掉（omp / pi，实测 2026-10-07）：xteam 起 agent 时带上
-`--append-system-prompt .xteam/identity/<角色>.md`（章程全文 + 一段「重置后先 whoami」
-的引导）。`/new` 换的是**会话**、`/clear` 丢的是**消息**，两者都动不了进程的系统提示词。
-其余 kind 没有这个 flag 时照旧把章程投进对话，并在每条门铃前自带一句身份与自检提醒。
+`--append-system-prompt .xteam/identity/<角色>.md`。这份文件放的是**核心卡**
+（`roles/<角色>.core.md`，约千字）和完整章程的路径；完整章程不再每个 turn 常驻
+system prompt，agent 需要细节时自己读相关章节。`/new` 换的是**会话**、`/clear`
+丢的是**消息**，两者都动不了进程的系统提示词。
+其余 kind 没有这个 flag 时，首次投递也只带核心卡 + 全文路径，不再抄全文。
 
-`xteam whoami` 是 agent 的看板视图：你欠什么义务、哪些切片没闭合、你上次的 recap 尾巴、
+`xteam whoami` 是 agent 的看板视图：你欠什么义务、哪些切片没闭合、按序队列、
 时间线尾部、该读哪些文件 —— 不依赖 herdr，pane 全关着也能看。
 
 ## 默认跑在 omp 上，不是 opencode
@@ -343,7 +353,7 @@ agent 干活常停在「要授权吗」的框上（写 /tmp、跑测试、开端
 | `xteam status` | 谁在干什么、谁欠着活、每个状态从几点开始 |
 | `xteam stamp <角色> "…"` | 记一条共享时间线（`--waiting` 声明在等人类） |
 | `xteam whoami` | 我这个角色是谁、欠什么、上次做到哪（一屏）—— 上下文被清空后第一件事 |
-| `xteam reopen <角色>` | **原地重开**：recap → 新会话 → 身份与现状自动投回（context 快满时用） |
+| `xteam reopen <角色>` | **原地重开**：新会话 → 按 `QUEUE.md` 与工件现算的现状自动投回（context 快满时用） |
 | `xteam watch status\|once\|stop` | 巡检：状态 / 手动跑一轮 / 停 |
 | `xteam projects` | 治理了哪些项目、依赖关系、各自未闭合的活 |
 | `xteam swap <角色> <agent>` | 中途换 agent，不用重启整套 |
